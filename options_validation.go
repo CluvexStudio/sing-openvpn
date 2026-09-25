@@ -208,8 +208,10 @@ func validateTLSOptionNames(optionsName string, verifyX509Type string, peerFinge
 		return E.New(optionsName, ".VerifyX509Type must be subject, name, or name-prefix")
 	}
 	for fingerprintIndex, fingerprint := range peerFingerprints {
-		if len(fingerprint) != 64 || !isLowerHex(fingerprint) {
-			return E.New(optionsName, ".PeerFingerprint[", fingerprintIndex, "] must be canonical lowercase hex")
+		// OpenVPN prints a fingerprint as colon-separated upper-case hex, and that is the form a
+		// .ovpn file carries; requiring the bare lower-case digest refused every one of them.
+		if !isCertificateFingerprint(fingerprint) {
+			return E.New(optionsName, ".PeerFingerprint[", fingerprintIndex, "] must be a SHA-256 certificate fingerprint")
 		}
 	}
 	_, err := parseRemoteCertKeyUsages(remoteCertKU)
@@ -243,6 +245,29 @@ func validateTLSOptionNames(optionsName string, verifyX509Type string, peerFinge
 	}
 	_, err = parseTLSGroups(tlsGroups)
 	return err
+}
+
+// isCertificateFingerprint reports whether value names a SHA-256 certificate digest, in either the
+// bare hex form or the colon-separated one OpenVPN prints and writes into a .ovpn file.
+func isCertificateFingerprint(value string) bool {
+	normalized := NormalizeCertificateFingerprint(value)
+	return len(normalized) == 64 && isLowerHex(normalized)
+}
+
+// NormalizeCertificateFingerprint reduces a fingerprint to the bare lower-case hex digest, so that
+// AB:CD:… and abcd… are the same value. Anything that is not a fingerprint is returned unchanged
+// and fails the check above.
+func NormalizeCertificateFingerprint(value string) string {
+	var builder strings.Builder
+	builder.Grow(len(value))
+	for _, character := range value {
+		switch character {
+		case ':', ' ', '-':
+		default:
+			builder.WriteRune(character)
+		}
+	}
+	return strings.ToLower(builder.String())
 }
 
 func isLowerHex(value string) bool {

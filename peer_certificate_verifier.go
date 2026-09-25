@@ -786,8 +786,12 @@ func verifyPeerFingerprint(peerCertificate *x509.Certificate, expectedFingerprin
 		return nil
 	}
 	actualFingerprint := computeCertificateFingerprint(peerCertificate.Raw)
-	if slices.Contains(expectedFingerprints, actualFingerprint) {
-		return nil
+	// The configured values keep whatever shape the profile wrote them in, so both sides are
+	// reduced to the bare digest before they are compared.
+	for _, expected := range expectedFingerprints {
+		if NormalizeCertificateFingerprint(expected) == actualFingerprint {
+			return nil
+		}
 	}
 	return E.New("peer fingerprint mismatch")
 }

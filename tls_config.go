@@ -462,8 +462,14 @@ func parseTLSCipherSuites(input string) ([]uint16, error) {
 }
 
 func lookupTLSCipherSuite(token string) (uint16, error) {
+	// OpenVPN writes these in the IANA spelling, with dashes rather than underscores
+	// (TLS-ECDHE-RSA-WITH-AES-256-GCM-SHA384), which is what a .ovpn file carries.
+	ianaToken := token
+	if strings.HasPrefix(strings.ToUpper(token), "TLS-") {
+		ianaToken = strings.ReplaceAll(token, "-", "_")
+	}
 	for _, pair := range tlsCipherTranslationTable {
-		if pair.openSSLName == token || tls.CipherSuiteName(pair.suiteID) == token {
+		if pair.openSSLName == token || tls.CipherSuiteName(pair.suiteID) == ianaToken {
 			return pair.suiteID, nil
 		}
 	}
@@ -498,7 +504,9 @@ func parseTLSGroups(input string) ([]tls.CurveID, error) {
 		if token == "" {
 			return nil, E.New("tls-groups contains an empty group name")
 		}
-		curveID, found := tlsGroupAliases[token]
+		// OpenSSL, and so OpenVPN, writes these as secp384r1 and prime256v1; the table is keyed
+		// in upper case, so matching the token as written rejected the ordinary spelling.
+		curveID, found := tlsGroupAliases[strings.ToUpper(token)]
 		if !found {
 			return nil, E.New("unsupported tls-groups name: ", token)
 		}
