@@ -28,6 +28,7 @@ type tlsServerSession struct {
 	// TM_INITIAL session shares with the TM_ACTIVE session it will replace.
 	resourceReservation atomic.Pointer[serverResourceReservation]
 	peerAddress         string
+	outboundQueue       OutboundQueue
 	selectedCipher      string
 	selectedAuth        string
 	authFailed          bool
@@ -63,9 +64,9 @@ func (s *tlsServer) newSession(packetConnection proto.PacketConnection) *tlsServ
 	handshakeWindow := s.parent.options.Timing.HandWindow
 	session := &tlsServerSession{
 		tlsPeerSession: &tlsPeerSession{
-			role:                    tlsRoleServer,
 			packetConnection:        packetConnection,
 			dataTransportHeaderSize: dataTransportHeaderSize(s.parent.protocol),
+			authDeferredWindow:      authDeferredExpireWindow(handshakeWindow, s.parent.options.Timing.RenegotiationInterval),
 			handshakeWindow:         handshakeWindow,
 		},
 		server:            s,
@@ -105,6 +106,11 @@ func (s *tlsServer) newSession(packetConnection proto.PacketConnection) *tlsServ
 		onRenegotiated: func(_ *tlsPeerSession, keyID uint8) {
 			session.noteRenegotiated(keyID)
 		},
+		onRenegotiationFailed: func(_ *tlsPeerSession, err error) {
+			if E.IsMulti(err, ErrAuthenticationFailed) {
+				_ = session.Close()
+			}
+		},
 	}
 	session.hooks = tlsPeerHooks{
 		outgoingDataPayloads: session.outgoingDataPayloads,
@@ -115,7 +121,7 @@ func (s *tlsServer) newSession(packetConnection proto.PacketConnection) *tlsServ
 		deliverIncomingBuffers: func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) {
 			session.deliverIncomingBuffers(payloads, codec, packetHeaderSize)
 		},
-		incomingPacketHeadroom: s.parent.options.DataChannel.PacketHeadroom,
+		incomingPacketHeadroom: s.parent.options.IncomingPacketHeadroom,
 		sessionTerminated: func(_ error) {
 			_ = session.Close()
 		},
@@ -154,7 +160,7 @@ func (s *tlsServerSession) releaseResourceReservation() {
 
 func (s *tlsServerSession) runWithClientReset(clientResetPacket *proto.Packet, protection tlsControlProtection) error {
 	defer s.Close()
-	defer s.releaseTunnelAddress()
+	defer s.releaseDataPlane()
 	s.protection = protection
 	var err error
 	s.sessionManager, err = proto.NewSessionManager()
@@ -180,7 +186,7 @@ func (s *tlsServerSession) runWithClientReset(clientResetPacket *proto.Packet, p
 
 func (s *tlsServerSession) runWithCookieResponse(cookieResponse *proto.Packet, protection tlsControlProtection, serverSessionID proto.SessionID) error {
 	defer s.Close()
-	defer s.releaseTunnelAddress()
+	defer s.releaseDataPlane()
 	if cookieResponse == nil {
 		return E.New("missing UDP cookie response")
 	}
@@ -323,6 +329,7 @@ func (s *tlsServerSession) runTLSHandshake(initialControlPacket *proto.Packet) e
 	}
 	s.configureRenegotiation(s.sessionManager.CurrentKeyID())
 	s.installInitialDataCodec(initialCodec, s.sessionManager.CurrentKeyID())
+	s.server.startOutboundQueue(s)
 	err = s.server.registerAuthenticatedIdentity(s)
 	if err != nil {
 		return err

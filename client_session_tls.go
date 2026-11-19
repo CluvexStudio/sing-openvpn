@@ -54,11 +54,11 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 	}
 	client := &tlsClient{
 		tlsPeerSession: &tlsPeerSession{
-			role:                    tlsRoleClient,
 			sessionManager:          sessionManager,
 			protection:              protection,
 			wrappedClientKey:        wrappedClientKey,
 			dataTransportHeaderSize: dataTransportHeaderSize(remote.remote.Protocol),
+			authDeferredWindow:      authDeferredExpireWindow(parent.options.Timing.HandWindow, parent.options.Timing.RenegotiationInterval),
 			handshakeWindow:         parent.options.Timing.HandWindow,
 		},
 		parent:             parent,
@@ -106,6 +106,12 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 				client.keepalive.noteRenegotiated(keyID)
 			}
 		},
+		// Upstream tls_multi_process gives up a tls_session once its key_state
+		// fails, and tls_pre_decrypt drops later control packets on that session
+		// id as stale; an upstream client negotiates a new tls_session instead.
+		onRenegotiationFailed: func(_ *tlsPeerSession, err error) {
+			client.finish(E.Cause(err, "renegotiate"))
+		},
 	}
 	client.hooks = tlsPeerHooks{
 		outgoingDataPayloads: func(payloads [][]byte, codec dataCodec, packetHeaderSize int) [][][]byte {
@@ -121,7 +127,7 @@ func newTLSClient(parent *Client, useActiveAuthToken bool, remote clientRemote) 
 		deliverIncomingBuffers: func(payloads []*buf.Buffer, codec dataCodec, packetHeaderSize int) {
 			client.parent.handleIncomingDataBuffers(payloads, codec, packetHeaderSize, client.mssFixOuterTransportOverhead())
 		},
-		incomingPacketHeadroom:   client.parent.options.DataChannel.PacketHeadroom,
+		incomingPacketHeadroom:   client.parent.options.IncomingPacketHeadroom,
 		sessionTerminated:        client.finish,
 		logDroppedIncomingPacket: client.parent.dataPlane.incomingPacketDropLog.Log,
 	}
@@ -606,7 +612,7 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, mustNegotiate t
 		OptionsString: c.localOptionsString,
 		Username:      username,
 		Password:      password,
-		PeerInfo:      buildTLSPeerInfo(c.parent.options, false),
+		PeerInfo:      buildTLSPeerInfo(c.parent.options, c.parent.options.Pull.Enabled),
 		KeySource:     clientKeySource,
 	})
 	if err != nil {

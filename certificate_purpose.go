@@ -1,8 +1,15 @@
 package openvpn
 
 import (
+	"bytes"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/asn1"
+
+	E "github.com/sagernet/sing/common/exceptions"
+
+	"golang.org/x/crypto/cryptobyte"
+	cryptobyte_asn1 "golang.org/x/crypto/cryptobyte/asn1"
 )
 
 // OpenSSL x509v3_cache_extensions caches these three extensions, and every
@@ -46,9 +53,6 @@ const (
 	openSSLExtendedKeyUsageServerGatedCrypto = 0x10
 )
 
-// OpenSSL NS_SSL_CA, checked by check_ssl_ca.
-const netscapeCertTypeSSLCertificateAuthority = 0x04
-
 var openSSLExtendedKeyUsageBits = []struct {
 	identifier asn1.ObjectIdentifier
 	bit        uint
@@ -72,7 +76,9 @@ const (
 
 // OpenSSL check_purpose_ssl_client / check_purpose_ssl_server, with
 // requireCertificateAuthority selecting check_ssl_ca as check_chain does for
-// every certificate above the leaf.
+// every certificate above the leaf. check_ssl_ca reads Netscape Cert Type
+// only for a certificate carrying neither basicConstraints nor keyUsage, which
+// chain verification never accepts as an issuer.
 func checkCertificatePurpose(certificate *x509.Certificate, purpose certificatePurpose, requireCertificateAuthority bool) (bool, error) {
 	usage, err := readCertificateUsageExtensions(certificate)
 	if err != nil {
@@ -84,7 +90,7 @@ func checkCertificatePurpose(certificate *x509.Certificate, purpose certificateP
 			return false, nil
 		}
 		if requireCertificateAuthority {
-			return !usage.rejectsNetscapeCertType(netscapeCertTypeSSLCertificateAuthority), nil
+			return true, nil
 		}
 		if usage.rejectsKeyUsage(openSSLKeyUsageDigitalSignature | openSSLKeyUsageKeyAgreement) {
 			return false, nil
@@ -95,7 +101,7 @@ func checkCertificatePurpose(certificate *x509.Certificate, purpose certificateP
 			return false, nil
 		}
 		if requireCertificateAuthority {
-			return !usage.rejectsNetscapeCertType(netscapeCertTypeSSLCertificateAuthority), nil
+			return true, nil
 		}
 		if usage.rejectsNetscapeCertType(netscapeCertTypeSSLServer) {
 			return false, nil
@@ -137,13 +143,17 @@ func readCertificateUsageExtensions(certificate *x509.Certificate) (certificateU
 	for _, extension := range certificate.Extensions {
 		switch {
 		case extension.Id.Equal(keyUsageExtensionOID):
-			var bitString asn1.BitString
-			_, err := asn1.Unmarshal(extension.Value, &bitString)
+			bits, err := readOpenSSLBitString(extension)
 			if err != nil {
 				return certificateUsageExtensions{}, err
 			}
 			usage.keyUsagePresent = true
-			usage.keyUsage = openSSLKeyUsageBits(bitString)
+			if len(bits) > 0 {
+				usage.keyUsage = uint(bits[0])
+			}
+			if len(bits) > 1 {
+				usage.keyUsage |= uint(bits[1]) << 8
+			}
 		case extension.Id.Equal(extendedKeyUsageExtensionOID):
 			var keyPurposes []asn1.ObjectIdentifier
 			_, err := asn1.Unmarshal(extension.Value, &keyPurposes)
@@ -159,34 +169,31 @@ func readCertificateUsageExtensions(certificate *x509.Certificate) (certificateU
 				}
 			}
 		case extension.Id.Equal(netscapeCertTypeExtensionOID):
-			var bitString asn1.BitString
-			_, err := asn1.Unmarshal(extension.Value, &bitString)
+			bits, err := readOpenSSLBitString(extension)
 			if err != nil {
 				return certificateUsageExtensions{}, err
 			}
 			usage.netscapeCertTypePresent = true
-			if len(bitString.Bytes) > 0 {
-				usage.netscapeCertType = bitString.Bytes[0]
+			if len(bits) > 0 {
+				usage.netscapeCertType = bits[0]
 			}
 		}
 	}
 	return usage, nil
 }
 
-// OpenSSL x509v3_cache_extensions builds ex_kusage from the first two
-// extension bytes, keeping the MSB-first order of the first byte in the low
-// half of the mask.
-func openSSLKeyUsageBits(bitString asn1.BitString) uint {
-	var keyUsage uint
-	for bitIndex := range 8 {
-		if bitString.At(bitIndex) == 1 {
-			keyUsage |= 1 << (7 - bitIndex)
-		}
+// OpenSSL X509V3_EXT_d2i ignores data after the value, and
+// c2i_ASN1_BIT_STRING clears the unused bits instead of rejecting them.
+func readOpenSSLBitString(extension pkix.Extension) ([]byte, error) {
+	var bits cryptobyte.String
+	value := cryptobyte.String(extension.Value)
+	if !value.ReadASN1(&bits, cryptobyte_asn1.BIT_STRING) || len(bits) == 0 || bits[0] > 7 {
+		return nil, E.New("invalid BIT STRING in certificate extension ", extension.Id)
 	}
-	for bitIndex := 8; bitIndex < 16; bitIndex++ {
-		if bitString.At(bitIndex) == 1 {
-			keyUsage |= 1 << (8 + 15 - bitIndex)
-		}
+	unusedBits := bits[0]
+	cleared := bytes.Clone(bits[1:])
+	if len(cleared) > 0 {
+		cleared[len(cleared)-1] &= 0xff << unusedBits
 	}
-	return keyUsage
+	return cleared, nil
 }
